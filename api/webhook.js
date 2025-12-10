@@ -1,5 +1,3 @@
-import fetch from "node-fetch";
-
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(200).send("Bot is running ✅");
@@ -14,7 +12,7 @@ export default async function handler(req, res) {
     let reply = "Hello! Send /start";
 
     if (text === "/start") {
-      reply = "✅ Bot is now working on Vercel!";
+      reply = "✅ JavaScript bot is working on Vercel!";
     }
 
     await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
