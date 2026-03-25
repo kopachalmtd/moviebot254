@@ -1,0 +1,5 @@
+flask
+python-telegram-bot
+supabase
+python-dotenv
+requests
