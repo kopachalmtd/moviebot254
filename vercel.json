@@ -1,7 +1,13 @@
 {
   "functions": {
-    "api/*.js": {
-      "runtime": "nodejs18.x"
+    "api/index.py": {
+      "runtime": "python@3.9",
+      "memory": 1024,
+      "maxDuration": 10
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/callback", "destination": "/api/index.py" },
+    { "source": "/(.*)", "destination": "/api/index.py" }
+  ]
 }
