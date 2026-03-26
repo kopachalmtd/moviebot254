@@ -4,16 +4,28 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# Get variables and provide a dummy string if they are missing to prevent 'NoneType' errors
-TOKEN = os.environ.get("BOT_TOKEN", "MISSING_TOKEN")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+# Get the token from Vercel settings
+TOKEN = os.environ.get("BOT_TOKEN")
 
-# This line was crashing because TOKEN was None
+# This check prevents the 'NoneType' crash you saw in the logs
+if not TOKEN:
+    raise ValueError("BOT_TOKEN is not set in Vercel Environment Variables!")
+
 bot = telebot.TeleBot(TOKEN, threaded=False)
 
 @app.route('/')
-def home():
-    if TOKEN == "MISSING_TOKEN":
-        return "❌ Error: BOT_TOKEN is missing in Vercel Environment Variables.", 500
-    return "✅ Bot is alive and TOKEN is loaded!", 200
+def index():
+    return "✅ Bot Server is running 24/7!", 200
+
+@app.route('/', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "OK", 200
+    return "Forbidden", 403
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "🚀 Bot is now running 24/7 on Vercel!")
