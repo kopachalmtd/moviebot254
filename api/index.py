@@ -3,7 +3,6 @@ import re
 import json
 import asyncio
 import time
-import base64
 from flask import Flask, request
 import requests
 from supabase import create_client, Client
@@ -64,6 +63,15 @@ def main_menu_keyboard(uid):
     return InlineKeyboardMarkup(kb)
 
 # ---------------- HANDLERS ----------------
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    # Handle both message and callback query updates
+    if update.message:
+        await update.message.reply_text("🎬 **MovieBot254 Active**", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.edit_text("🎬 **Main Menu**", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -71,19 +79,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     data = q.data
 
-    # BACK TO MENU
+    # BACK TO MENU (Added as requested)
     if data == "menu":
-        await q.message.edit_text("🎬 **Main Menu**", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
+        await start_handler(update, context)
         return
 
-    elif data == "bal":
+    if data == "bal":
         await q.message.edit_text(f"💰 **Your balance:** KES {user['balance']}", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
-    
     elif data == "deposit":
         user["state"] = "awaiting_amount"
         save_user(uid, user)
         await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
-    
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
@@ -93,18 +99,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
         ]
         await q.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-    elif data.startswith("admin_"):
+    
+    # Trigger Admin state from buttons
+    elif data.startswith("admin_") and data != "admin_panel":
         context.user_data["admin_action"] = data + "_wait_user"
-        await q.message.edit_text("🎯 Send the **Target User ID** now:")
+        await q.message.edit_text("🎯 Send the **Target User ID**:")
+        return
+
+    # fallback (Added as requested)
+    else:
+        try:
+            await q.message.edit_text("Unrecognized action. Use /start to open menu.")
+        except:
+            pass
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    text = (update.message.text or "").strip()
+    # get_user acts as ensure_user/load_db for Supabase
     user = get_user(uid)
-    state = user.get("state")
+    text = (update.message.text or "").strip()
 
-    # --- ADMIN MULTI-STEP LOGIC ---
+    # --- ADMIN MULTI-STEP LOGIC (Added as requested) ---
     admin_action = context.user_data.get("admin_action")
     if admin_action:
         if admin_action.endswith("_wait_user"):
@@ -114,14 +129,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Enter amount (KES):")
                 return
             
+            # block/delete immediate
             target = context.user_data.get("admin_target_user")
-            target_data = get_user(target)
+            target_data = get_user(target) # Fetches from Supabase
+            
             if admin_action.startswith("admin_block"):
                 target_data["blocked"] = not target_data.get("blocked", False)
-                save_user(target, target_data)
-                await update.message.reply_text(f"User {target} blocked: {target_data['blocked']}.")
+                save_user(target, target_data) # Saves to Supabase
+                await update.message.reply_text(f"User {target} blocked toggled to {target_data['blocked']}.")
             
+            elif admin_action.startswith("admin_delete"):
+                supabase.table("users").delete().eq("id", target).execute()
+                await update.message.reply_text(f"User {target} deleted.")
+
             context.user_data.pop("admin_action", None)
+            context.user_data.pop("admin_target_user", None)
             return
 
         if admin_action.endswith("_wait_amount"):
@@ -135,18 +157,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if admin_action.startswith("admin_addbal"):
                 target_data["balance"] += amt
                 save_user(target, target_data)
-                await update.message.reply_text(f"Added KES {amt} to {target}.")
+                await update.message.reply_text(f"Added KES {amt} to {target}. New balance: KES {target_data['balance']}")
                 try: await context.bot.send_message(chat_id=int(target), text=f"✅ Admin added KES {amt} to your account.")
                 except: pass
+            
             elif admin_action.startswith("admin_removebal"):
                 target_data["balance"] = max(0, target_data["balance"] - amt)
                 save_user(target, target_data)
-                await update.message.reply_text(f"Removed KES {amt} from {target}.")
+                await update.message.reply_text(f"Removed KES {amt} from {target}. New balance: KES {target_data['balance']}")
+                try: await context.bot.send_message(chat_id=int(target), text=f"❌ Admin removed KES {amt} from your account.")
+                except: pass
 
             context.user_data.pop("admin_action", None)
+            context.user_data.pop("admin_target_user", None)
             return
 
-    # --- DEPOSIT FLOW ---
+    # --- DEPOSIT FLOW (Kept existing) ---
+    state = user.get("state")
     if state == "awaiting_amount" and text.isdigit():
         user["temp_amt"] = int(text)
         user["state"] = "awaiting_phone"
@@ -156,7 +183,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state == "awaiting_phone":
         formatted_phone = format_phone_number(text)
         if not formatted_phone:
-            await update.message.reply_text("❌ Invalid format.")
+            await update.message.reply_text("❌ Invalid format. Use 07XXXXXXXX.")
             return
 
         amt = user["temp_amt"]
@@ -165,9 +192,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         headers = {'Authorization': f'Basic {os.getenv("PAYHERO_AUTH")}', 'Content-Type': 'application/json'}
         payload = {
-            "amount": amt, "phone_number": formatted_phone, "channel_id": int(os.getenv("PAYHERO_CHANNEL_ID", "4131")),
-            "provider": "m-pesa", "external_reference": f"{uid}_TOPUP_{int(time.time())}",
-            "customer_name": update.effective_user.full_name or "User",
+            "amount": amt,
+            "phone_number": formatted_phone,
+            "channel_id": int(os.getenv("PAYHERO_CHANNEL_ID", "4131")),
+            "provider": "m-pesa",
+            "external_reference": f"{uid}_TOPUP_{int(time.time())}",
+            "customer_name": update.effective_user.full_name or "MovieBot User",
             "callback_url": f"https://{request.host}/payhero-callback"
         }
         
@@ -177,7 +207,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"⚠️ Error: {resp.json().get('message', 'Rejected')}")
 
-# ---------------- VERCEL ENTRY ----------------
 @app.route("/", methods=["POST"])
 async def telegram_webhook():
     data = request.get_json(force=True)
@@ -185,7 +214,7 @@ async def telegram_webhook():
     async with application:
         if update.message and update.message.text:
             if update.message.text == "/start":
-                await update.message.reply_text("🎬 **MovieBot254 Active**", reply_markup=main_menu_keyboard(str(update.effective_user.id)), parse_mode="Markdown")
+                await start_handler(update, None)
             else:
                 await text_handler(update, None)
         elif update.callback_query:
@@ -207,8 +236,9 @@ def payhero_callback():
             user["balance"] += int(float(amount))
             save_user(uid, user)
             requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": uid, "text": f"✅ Payment Received: KES {amount}"})
-    return "online", 200
+            
+    return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot Online", 200
+    return "Bot 2 Online", 200
