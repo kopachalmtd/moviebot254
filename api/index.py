@@ -15,7 +15,6 @@ app = Flask(__name__)
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-# Ensure this URL is exactly as shown below
 PAYHERO_API_URL = os.getenv("PAYHERO_API_URL", "https://backend.payhero.co.ke/api/v2/payments")
 
 # Supabase Config
@@ -93,7 +92,7 @@ async def callback_router(update: Update, context):
     elif data == "admin_view_users":
         res = supabase.table("users").select("id, data").limit(15).execute()
         rows = [f"`{r['id']}` | KES {r['data'].get('balance',0)}" for r in res.data]
-        text = "👥 **Recent Users:**\n" + ("\n".join(rows) if rows else "No users found.")
+        text = "👥 **Recent Users:**\n" + "\n".join(rows) if rows else "No users found."
         await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="admin_panel")]]), parse_mode="Markdown")
     elif data in ("admin_addbal", "admin_removebal", "admin_block"):
         user["state"] = f"{data}_wait_user"
@@ -106,7 +105,6 @@ async def text_handler(update: Update, context):
     text = update.message.text.strip()
     state = user.get("state")
 
-    # --- ADMIN LOGIC ---
     if state and state.startswith("admin_"):
         if state.endswith("_wait_user"):
             user["admin_target"] = text
@@ -131,7 +129,6 @@ async def text_handler(update: Update, context):
             save_user(uid, user)
             await update.message.reply_text(f"✅ Success! `{target_uid}` balance updated.")
 
-    # --- DEPOSIT LOGIC ---
     elif state == "awaiting_amount" and text.isdigit():
         user["temp_amt"] = int(text)
         user["state"] = "awaiting_phone"
@@ -147,11 +144,7 @@ async def text_handler(update: Update, context):
         user["state"] = None
         save_user(uid, user)
 
-        # PayHero Credentials
-        u_name = os.getenv("PAYHERO_USERNAME")
-        p_word = os.getenv("PAYHERO_PASSWORD")
-        auth = base64.b64encode(f"{u_name}:{p_word}".encode()).decode()
-        
+        auth = base64.b64encode(f"{os.getenv('PAYHERO_USERNAME')}:{os.getenv('PAYHERO_PASSWORD')}".encode()).decode()
         payload = {
             "amount": amt,
             "phone_number": formatted_phone,
@@ -159,26 +152,12 @@ async def text_handler(update: Update, context):
             "external_reference": f"{uid}_TOPUP_{int(time.time())}",
             "callback_url": f"https://{request.host}/payhero-callback"
         }
-        
-        # Call PayHero with detailed Debugging
         resp = requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
-        
-        # Logging to Vercel (Check your dashboard logs!)
-        print(f"DEBUG: PayHero Status: {resp.status_code}")
-        print(f"DEBUG: PayHero Response: {resp.text}")
+        if resp.status_code in [200, 201]:
+            await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
+        else:
+            await update.message.reply_text("⚠️ PayHero rejected the request. Check your credentials.")
 
-        try:
-            res_json = resp.json()
-            if resp.status_code in [200, 201] and (res_json.get("success") or res_json.get("status") == "Success"):
-                await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
-            else:
-                # This grabs the specific error message from PayHero
-                error_detail = res_json.get("message", "Invalid API Credentials or Channel ID.")
-                await update.message.reply_text(f"⚠️ **PayHero Rejected:** {error_detail}")
-        except Exception:
-            await update.message.reply_text("⚠️ **System Error:** Failed to initiate STK push.")
-
-# ---------------- VERCEL ENTRY ----------------
 @app.route("/", methods=["POST"])
 async def telegram_webhook():
     data = request.get_json(force=True)
@@ -196,8 +175,7 @@ async def telegram_webhook():
 @app.route("/payhero-callback", methods=["POST"])
 def payhero_callback():
     payload = request.get_json(force=True)
-    # Handle different possible nesting from PayHero
-    data = payload.get("response", payload.get("data", payload))
+    data = payload.get("response", payload.get("data", {}))
     
     status = str(data.get("Status", "")).strip().capitalize()
     ref = data.get("ExternalReference", "")
@@ -213,11 +191,11 @@ def payhero_callback():
             save_user(uid, user)
             requests.post(url, json={"chat_id": uid, "text": f"✅ **Payment Received!**\nKES {amount} added to your balance.", "parse_mode": "Markdown"})
         elif status in ["Cancelled", "Failed"]:
-            desc = data.get("Description", "Transaction failed or was cancelled.")
+            desc = data.get("Description", "Transaction failed or timed out.")
             requests.post(url, json={"chat_id": uid, "text": f"❌ **Transaction {status}**\n{desc}", "parse_mode": "Markdown"})
             
     return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot 5 Online", 200
+    return "Bot Online", 200
