@@ -1,5 +1,5 @@
+flask[async]
 python-telegram-bot
 supabase
-flask
 requests
 python-dotenv
