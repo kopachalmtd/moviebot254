@@ -1,6 +1,5 @@
 {
   "rewrites": [
-    { "source": "/callback", "destination": "/api/index.py" },
     { "source": "/(.*)", "destination": "/api/index.py" }
   ]
 }
