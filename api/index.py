@@ -3,10 +3,11 @@ import re
 import json
 import time
 import requests
+import asyncio
 from flask import Flask, request
 from supabase import create_client, Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, ContextTypes
+from telegram.ext import ApplicationBuilder
 
 app = Flask(__name__)
 
@@ -20,6 +21,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Initialize Application
 application = ApplicationBuilder().token(TOKEN).build()
 
 # ---------------- MOVIE DATABASE ----------------
@@ -85,15 +87,12 @@ async def callback_router(update: Update):
 
     if data == "menu":
         await start_handler(update)
-    
     elif data == "bal":
         await q.message.reply_text(f"Dear customer, your balance is **KSH {user['balance']}**.", reply_markup=main_menu_keyboard(uid))
-
     elif data == "myp":
         p = user.get("purchases", [])
         msg = "💼 **Purchases:**\n" + ("\n".join(p) if p else "None yet.")
         await q.message.reply_text(msg, reply_markup=main_menu_keyboard(uid))
-
     elif data == "claim_bonus":
         if len(user.get("purchases", [])) >= 5 and not user.get("bonus_claimed"):
             user["balance"] += 20
@@ -102,19 +101,17 @@ async def callback_router(update: Update):
             await q.message.reply_text("🎁 **Bonus Added!** KSH 20 credited.", reply_markup=main_menu_keyboard(uid))
         else:
             await q.message.reply_text("❌ Buy 5 movies first or bonus already claimed.", reply_markup=main_menu_keyboard(uid))
-
     elif data == "req_reset":
         for admin in ADMIN_IDS:
             kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"admin_approvereset_{uid}")]]
             await application.bot.send_message(chat_id=admin, text=f"⚠️ Reset Request: `{uid}`", reply_markup=InlineKeyboardMarkup(kb))
         await q.message.reply_text("📩 Reset request sent to admin.")
-
     elif data.startswith("browse_"):
         page = int(data.split("_")[1])
         per_page = 50
         movies = MOVIES[page*per_page:(page+1)*per_page]
         kb = []
-        for i in range(0, len(movies), 2): # 2 per row
+        for i in range(0, len(movies), 2):
             row = [InlineKeyboardButton(m["title"][:15], callback_data=f"buy_{m['id']}") for m in movies[i:i+2]]
             kb.append(row)
         nav = []
@@ -123,7 +120,6 @@ async def callback_router(update: Update):
         if nav: kb.append(nav)
         kb.append([InlineKeyboardButton("⬅ Menu", callback_data="menu")])
         await q.message.reply_text(f"🎥 **Movies (Pg {page+1})**", reply_markup=InlineKeyboardMarkup(kb))
-
     elif data.startswith("buy_"):
         m_id = data.split("_")[1]
         movie = next((m for m in MOVIES if m["id"] == m_id), None)
@@ -134,12 +130,10 @@ async def callback_router(update: Update):
             user["purchases"].append(movie["title"])
             save_user(uid, user)
             await application.bot.send_video(chat_id=uid, video=movie["file_id"], caption=f"✅ {movie['title']}")
-
     elif data == "deposit":
         user["state"] = "wait_amt"
         save_user(uid, user)
         await q.message.reply_text("💳 Enter Amount (KSH):")
-
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
@@ -149,7 +143,6 @@ async def callback_router(update: Update):
             [InlineKeyboardButton("⬅ Menu", callback_data="menu")]
         ]
         await q.message.reply_text("🛠 **Admin Panel**", reply_markup=InlineKeyboardMarkup(kb))
-
     elif data.startswith("admin_"):
         if "view" in data:
             res = supabase.table("users").select("id").execute()
@@ -180,10 +173,20 @@ async def text_handler(update: Update):
                 save_user(uid, user)
                 await update.message.reply_text("Enter amount:")
             else:
-                # Handle block/delete/bc immediately
                 user["admin_action"] = None
                 save_user(uid, user)
                 await update.message.reply_text(f"Processing {action} on {text}...")
+            return
+        if action.endswith("_wait_amt") and text.isdigit():
+            target_id = user["admin_target"]
+            target_user = get_user(target_id)
+            amt = int(text)
+            if "addbal" in action: target_user["balance"] += amt
+            else: target_user["balance"] = max(0, target_user["balance"] - amt)
+            save_user(target_id, target_user)
+            user["admin_action"] = None
+            save_user(uid, user)
+            await update.message.reply_text(f"✅ Balance updated for `{target_id}`.")
             return
 
     if user.get("state") == "wait_amt" and text.isdigit():
@@ -217,14 +220,22 @@ async def text_handler(update: Update):
 
 # ---------------- WEBHOOKS ----------------
 @app.route("/", methods=["POST"])
-async def telegram_webhook():
+def telegram_webhook():
     data = request.get_json(force=True)
     update = Update.de_json(data, application.bot)
-    async with application:
-        if update.message:
-            if update.message.text == "/start": await start_handler(update)
-            else: await text_handler(update)
-        elif update.callback_query: await callback_router(update)
+    
+    # Run the async handlers within the current loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def process():
+        async with application:
+            if update.message:
+                if update.message.text == "/start": await start_handler(update)
+                else: await text_handler(update)
+            elif update.callback_query: await callback_router(update)
+            
+    loop.run_until_complete(process())
     return "OK", 200
 
 @app.route("/payhero-callback", methods=["POST"])
@@ -241,8 +252,6 @@ def payhero_callback():
             u["balance"] += int(float(d.get("Amount", 0)))
             save_user(uid, u)
             requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": uid, "text": "✅ Payment Received!", "reply_markup": main_menu_keyboard(uid).to_dict()})
-        else:
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": uid, "text": f"❌ Payment {status}", "reply_markup": main_menu_keyboard(uid).to_dict()})
     return "OK", 200
 
 @app.route("/")
