@@ -198,4 +198,4 @@ def payhero_callback():
 
 @app.route("/")
 def index():
-    return "Bot Online", 200
+    return "Bot live Online", 200
