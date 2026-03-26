@@ -21,7 +21,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Bot Application (Keep this outside the route)
+# Initialize Bot Application
 application = ApplicationBuilder().token(TOKEN).build()
 
 # ---------------- HELPERS ----------------
@@ -40,7 +40,7 @@ def get_user(uid):
     if not res.data:
         default_data = {
             "balance": 0, "purchases": [], "blocked": False, 
-            "state": None, "temp_amt": None, "admin_target": None
+            "state": None, "temp_amt": None, "admin_action": None, "admin_target": None
         }
         supabase.table("users").insert({"id": str(uid), "data": default_data}).execute()
         return default_data
@@ -64,7 +64,7 @@ def main_menu_keyboard(uid):
 
 # ---------------- HANDLERS ----------------
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_handler(update: Update):
     uid = str(update.effective_user.id)
     msg = "🎬 **MovieBot254 Active**"
     if update.message:
@@ -72,16 +72,19 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.callback_query:
         await update.callback_query.message.edit_text(msg, reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_router(update: Update):
     q = update.callback_query
     await q.answer()
     uid = str(q.from_user.id)
     user = get_user(uid)
     data = q.data
 
+    # BACK TO MENU
     if data == "menu":
-        await start_handler(update, context)
-    elif data == "bal":
+        await start_handler(update)
+        return
+
+    if data == "bal":
         await q.message.edit_text(f"💰 **Your balance:** KES {user['balance']}", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
     elif data == "deposit":
         user["state"] = "awaiting_amount"
@@ -96,30 +99,70 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
         ]
         await q.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
     elif data.startswith("admin_"):
-        context.user_data["admin_action"] = data + "_wait_user"
+        user["admin_action"] = data + "_wait_user"
+        save_user(uid, user)
         await q.message.edit_text("🎯 Send the **Target User ID**:")
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_handler(update: Update):
     uid = str(update.effective_user.id)
     user = get_user(uid)
     text = (update.message.text or "").strip()
 
-    # Admin Logic
-    admin_action = context.user_data.get("admin_action") if context else None
+    # --- ADMIN MULTI-STEP (Using DB storage) ---
+    admin_action = user.get("admin_action")
     if admin_action:
-        # ... (Your existing admin flow code stays exactly here) ...
-        # Ensure context.user_data calls are inside this 'if context' block
-        pass 
+        if admin_action.endswith("_wait_user"):
+            user["admin_target"] = text
+            if "addbal" in admin_action or "removebal" in admin_action:
+                user["admin_action"] = admin_action.replace("_wait_user", "_wait_amount")
+                save_user(uid, user)
+                await update.message.reply_text("Enter amount (KES):")
+                return
+            
+            # Immediate actions (Block/Delete)
+            target = text
+            target_data = get_user(target)
+            if "block" in admin_action:
+                target_data["blocked"] = not target_data.get("blocked", False)
+                save_user(target, target_data)
+                await update.message.reply_text(f"User {target} blocked: {target_data['blocked']}")
+            
+            user["admin_action"] = None # Clear state
+            save_user(uid, user)
+            return
 
-    # Deposit Logic
+        if admin_action.endswith("_wait_amount"):
+            target = user.get("admin_target")
+            if not text.isdigit():
+                await update.message.reply_text("Enter numeric amount only.")
+                return
+            amt = int(text)
+            target_data = get_user(target)
+            
+            if "addbal" in admin_action:
+                target_data["balance"] += amt
+                save_user(target, target_data)
+                await update.message.reply_text(f"Added KES {amt} to {target}.")
+                try: await application.bot.send_message(chat_id=int(target), text=f"✅ KES {amt} added to your balance.")
+                except: pass
+            elif "removebal" in admin_action:
+                target_data["balance"] = max(0, target_data["balance"] - amt)
+                save_user(target, target_data)
+                await update.message.reply_text(f"Removed KES {amt} from {target}.")
+
+            user["admin_action"] = None # Clear state
+            save_user(uid, user)
+            return
+
+    # --- DEPOSIT FLOW ---
     state = user.get("state")
     if state == "awaiting_amount" and text.isdigit():
         user["temp_amt"] = int(text)
         user["state"] = "awaiting_phone"
         save_user(uid, user)
         await update.message.reply_text("📱 Enter M-Pesa Number (07...):")
-        return # Important: Stop here
     
     elif state == "awaiting_phone":
         phone = format_phone_number(text)
@@ -146,37 +189,48 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(f"⚠️ Error: {resp.json().get('message', 'Rejected')}")
         except Exception as e:
-            await update.message.reply_text(f"📡 Connection Error: {str(e)}")
+            await update.message.reply_text(f"📡 Error: {str(e)}")
 
 # ---------------- WEBHOOK ----------------
+
 @app.route("/", methods=["POST"])
 async def telegram_webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
         
-        # We need the context for user_data to work!
+        # Ensure the bot application is initialized and started
         async with application:
             if update.message and update.message.text:
                 if update.message.text == "/start":
-                    await start_handler(update, application.default_context)
+                    await start_handler(update)
                 else:
-                    # Pass the application context so user_data doesn't crash
-                    await text_handler(update, application.default_context)
+                    await text_handler(update)
             elif update.callback_query:
-                await callback_router(update, application.default_context)
+                await callback_router(update)
                 
         return "OK", 200
     except Exception as e:
-        # If it "freezes", this will help you see the error in Vercel logs
         print(f"WEBHOOK ERROR: {e}")
-        return "OK", 200 # Always return 200 to Telegram
+        return "OK", 200 
 
 @app.route("/payhero-callback", methods=["POST"])
 def payhero_callback():
-    # ... (Keep your existing callback logic) ...
+    payload = request.get_json(force=True)
+    data = payload.get("response", payload.get("data", {}))
+    status = str(data.get("Status", "")).strip().capitalize()
+    ref = data.get("ExternalReference", "")
+    
+    if "_TOPUP_" in ref:
+        uid = ref.split("_TOPUP_")[0]
+        amount = data.get("Amount", 0)
+        if status == "Success":
+            user = get_user(uid)
+            user["balance"] += int(float(amount))
+            save_user(uid, user)
+            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": uid, "text": f"✅ Payment Received: KES {amount}"})
     return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot 5 Online", 200
+    return "Bot Online", 200
