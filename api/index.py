@@ -2,7 +2,6 @@ import os
 import re
 import json
 import asyncio
-import base64
 import time
 from flask import Flask, request
 import requests
@@ -15,7 +14,7 @@ app = Flask(__name__)
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-PAYHERO_API_URL = os.getenv("PAYHERO_API_URL", "https://backend.payhero.co.ke/api/v2/payments")
+PAYHERO_API_URL = 'https://backend.payhero.co.ke/api/v2/payments'
 
 # Supabase Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -27,7 +26,6 @@ application = ApplicationBuilder().token(TOKEN).build()
 
 # ---------------- HELPERS ----------------
 def format_phone_number(phone):
-    """Sanitizes 07..., 01..., or 254... to 254... format"""
     phone = re.sub(r"[^0-9]", "", phone)
     if (phone.startswith("07") or phone.startswith("01")) and len(phone) == 10:
         return "254" + phone[1:]
@@ -89,15 +87,6 @@ async def callback_router(update: Update, context):
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
         ]
         await q.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    elif data == "admin_view_users":
-        res = supabase.table("users").select("id, data").limit(15).execute()
-        rows = [f"`{r['id']}` | KES {r['data'].get('balance',0)}" for r in res.data]
-        text = "👥 **Recent Users:**\n" + "\n".join(rows) if rows else "No users found."
-        await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="admin_panel")]]), parse_mode="Markdown")
-    elif data in ("admin_addbal", "admin_removebal", "admin_block"):
-        user["state"] = f"{data}_wait_user"
-        save_user(uid, user)
-        await q.message.edit_text("🎯 Send the **Target User ID** now:")
 
 async def text_handler(update: Update, context):
     uid = str(update.effective_user.id)
@@ -105,35 +94,12 @@ async def text_handler(update: Update, context):
     text = update.message.text.strip()
     state = user.get("state")
 
-    if state and state.startswith("admin_"):
-        if state.endswith("_wait_user"):
-            user["admin_target"] = text
-            if "bal" in state:
-                user["state"] = state.replace("_wait_user", "_wait_amount")
-                save_user(uid, user)
-                await update.message.reply_text(f"💰 Target: `{text}`. Enter Amount:")
-            else:
-                target_data = get_user(text)
-                target_data["blocked"] = not target_data.get("blocked", False)
-                save_user(text, target_data)
-                user["state"] = None
-                save_user(uid, user)
-                await update.message.reply_text(f"✅ User `{text}` blocked status updated.")
-        elif state.endswith("_wait_amount") and text.isdigit():
-            target_uid = user.get("admin_target")
-            amt = int(text)
-            target_data = get_user(target_uid)
-            target_data["balance"] = (target_data["balance"] + amt) if "addbal" in state else max(0, target_data["balance"] - amt)
-            save_user(target_uid, target_data)
-            user["state"] = None
-            save_user(uid, user)
-            await update.message.reply_text(f"✅ Success! `{target_uid}` balance updated.")
-
-    elif state == "awaiting_amount" and text.isdigit():
+    if state == "awaiting_amount" and text.isdigit():
         user["temp_amt"] = int(text)
         user["state"] = "awaiting_phone"
         save_user(uid, user)
         await update.message.reply_text("📱 Enter M-Pesa Number (07... or 01... or 254...):")
+    
     elif state == "awaiting_phone":
         formatted_phone = format_phone_number(text)
         if not formatted_phone:
@@ -144,19 +110,30 @@ async def text_handler(update: Update, context):
         user["state"] = None
         save_user(uid, user)
 
-        auth = base64.b64encode(f"{os.getenv('PAYHERO_USERNAME')}:{os.getenv('PAYHERO_PASSWORD')}".encode()).decode()
+        # Using your exact headers and structure
+        headers = {
+            'Authorization': f'Basic {os.getenv("PAYHERO_AUTH")}',
+            'Content-Type': 'application/json',
+        }
+
         payload = {
             "amount": amt,
             "phone_number": formatted_phone,
-            "channel_id": os.getenv("PAYHERO_CHANNEL_ID"),
+            "channel_id": int(os.getenv("PAYHERO_CHANNEL_ID", "4131")),
+            "provider": "m-pesa",
             "external_reference": f"{uid}_TOPUP_{int(time.time())}",
+            "customer_name": update.effective_user.full_name or "MovieBot User",
             "callback_url": f"https://{request.host}/payhero-callback"
         }
-        resp = requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
-        if resp.status_code in [200, 201]:
+        
+        resp = requests.post(PAYHERO_API_URL, json=payload, headers=headers)
+        res_json = resp.json()
+
+        if resp.status_code in [200, 201] and res_json.get("status") == "Success":
             await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
         else:
-            await update.message.reply_text("⚠️ PayHero rejected the request. Check your credentials.")
+            error_msg = res_json.get("message", "Request rejected by PayHero.")
+            await update.message.reply_text(f"⚠️ **PayHero Error:** {error_msg}")
 
 @app.route("/", methods=["POST"])
 async def telegram_webhook():
@@ -191,11 +168,10 @@ def payhero_callback():
             save_user(uid, user)
             requests.post(url, json={"chat_id": uid, "text": f"✅ **Payment Received!**\nKES {amount} added to your balance.", "parse_mode": "Markdown"})
         elif status in ["Cancelled", "Failed"]:
-            desc = data.get("Description", "Transaction failed or timed out.")
-            requests.post(url, json={"chat_id": uid, "text": f"❌ **Transaction {status}**\n{desc}", "parse_mode": "Markdown"})
+            requests.post(url, json={"chat_id": uid, "text": f"❌ **Transaction {status}**", "parse_mode": "Markdown"})
             
     return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot live Online", 200
+    return "Bot Online", 200
