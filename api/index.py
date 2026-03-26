@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import base64
+import time
 from flask import Flask, request
 import requests
 from supabase import create_client, Client
@@ -26,7 +27,7 @@ application = ApplicationBuilder().token(TOKEN).build()
 
 # ---------------- HELPERS ----------------
 def format_phone_number(phone):
-    """Sanitizes 07..., 01..., or 254... to 2547... format"""
+    """Sanitizes 07..., 01..., or 254... to 254... format"""
     phone = re.sub(r"[^0-9]", "", phone)
     if (phone.startswith("07") or phone.startswith("01")) and len(phone) == 10:
         return "254" + phone[1:]
@@ -82,7 +83,6 @@ async def callback_router(update: Update, context):
         save_user(uid, user)
         await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
 
-    # --- ADMIN ACTIONS ---
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
@@ -134,7 +134,7 @@ async def text_handler(update: Update, context):
             save_user(target_uid, target_data)
             user["state"] = None
             save_user(uid, user)
-            await update.message.reply_text(f"✅ Success! `{target_uid}` balance is now KES {target_data['balance']}.")
+            await update.message.reply_text(f"✅ Success! `{target_uid}` balance updated.")
 
     # --- DEPOSIT LOGIC ---
     elif state == "awaiting_amount" and text.isdigit():
@@ -153,18 +153,19 @@ async def text_handler(update: Update, context):
         user["state"] = None
         save_user(uid, user)
 
-        # STK Push via PayHero
         auth = base64.b64encode(f"{os.getenv('PAYHERO_USERNAME')}:{os.getenv('PAYHERO_PASSWORD')}".encode()).decode()
         payload = {
             "amount": amt,
             "phone_number": formatted_phone,
             "channel_id": os.getenv("PAYHERO_CHANNEL_ID"),
-            "provider": "m-pesa",
-            "external_reference": f"{uid}_TOPUP_{amt}",
+            "external_reference": f"{uid}_TOPUP_{int(time.time())}", # Unique Ref
             "callback_url": f"https://{request.host}/payhero-callback"
         }
-        requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
-        await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
+        resp = requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
+        if resp.status_code in [200, 201]:
+            await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
+        else:
+            await update.message.reply_text("⚠️ PayHero rejected the request. Check your credentials.")
 
 # ---------------- VERCEL ENTRY ----------------
 @app.route("/", methods=["POST"])
@@ -183,16 +184,27 @@ async def telegram_webhook():
 
 @app.route("/payhero-callback", methods=["POST"])
 def payhero_callback():
-    data = request.get_json(force=True).get("response", {})
-    if data.get("Status") == "Success":
-        ref = data.get("ExternalReference", "")
+    payload = request.get_json(force=True)
+    data = payload.get("response", payload.get("data", {}))
+    
+    status = str(data.get("Status", "")).strip().capitalize()
+    ref = data.get("ExternalReference", "")
+    
+    if "_TOPUP_" in ref:
         uid = ref.split("_TOPUP_")[0]
-        amount = int(float(data.get("Amount", 0)))
-        user = get_user(uid)
-        user["balance"] += amount
-        save_user(uid, user)
-        # Notify user via API
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": uid, "text": f"✅ Payment Received! KES {amount} added to balance."})
+        amount = data.get("Amount", 0)
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+        if status == "Success":
+            user = get_user(uid)
+            user["balance"] += int(float(amount))
+            save_user(uid, user)
+            requests.post(url, json={"chat_id": uid, "text": f"✅ **Payment Received!**\nKES {amount} added to your balance.", "parse_mode": "Markdown"})
+        
+        elif status in ["Cancelled", "Failed"]:
+            desc = data.get("Description", "Transaction failed or timed out.")
+            requests.post(url, json={"chat_id": uid, "text": f"❌ **Transaction {status}**\n{desc}", "parse_mode": "Markdown"})
+            
     return "OK", 200
 
 @app.route("/")
