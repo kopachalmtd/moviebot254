@@ -57,6 +57,73 @@ def main_menu_keyboard(uid):
     if int(uid) in ADMIN_IDS:
         kb.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(kb)
+    if data == "admin_panel":
+        if int(uid) not in ADMIN_IDS:
+            await q.message.edit_text("Unauthorized.")
+            return
+        kb = [
+            [InlineKeyboardButton("👥 View Users", callback_data="admin_view_users")],
+            [InlineKeyboardButton("➕ Add Balance", callback_data="admin_addbal"), InlineKeyboardButton("➖ Remove Balance", callback_data="admin_removebal")],
+            [InlineKeyboardButton("⛔ Block/Unblock User", callback_data="admin_block")],
+            [InlineKeyboardButton("🗑️ Delete User", callback_data="admin_delete")],
+            [InlineKeyboardButton("⬅ Back", callback_data="menu")],
+        ]
+        await q.message.edit_text("Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # Admin actions (view, add, remove, block, delete)
+    if data == "admin_view_users":
+        if int(uid) not in ADMIN_IDS:
+            await q.message.edit_text("Unauthorized.")
+            return
+        db = load_db()
+        rows = []
+        for i, (u_id, uinfo) in enumerate(db.items()):
+            if i >= 50:
+                break
+            rows.append(f"{u_id} — KES {uinfo.get('balance',0)} — purchases {len(uinfo.get('purchases',[]))} — blocked:{uinfo.get('blocked',False)}")
+        text = "Users:\n" + ("\n".join(rows) if rows else "No users")
+        await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="admin_panel")]]))
+        return
+
+    if data in ("admin_addbal", "admin_removebal", "admin_block", "admin_delete"):
+        if int(uid) not in ADMIN_IDS:
+            await q.message.edit_text("Unauthorized.")
+            return
+        # set admin multi-step state
+        context.user_data["admin_action"] = data + "_wait_user"
+        await q.message.edit_text("Send the target user's numeric ID now (e.g. 6725602268).")
+        return
+
+    # admin approve/reset callbacks
+    if data.startswith("admin_approve_reset_") or data.startswith("admin_reject_reset_"):
+        if int(uid) not in ADMIN_IDS:
+            await q.message.edit_text("Unauthorized.")
+            return
+        parts = data.split("_")
+        target = parts[-1]
+        db = load_db()
+        target_user = db.get(target)
+        if not target_user:
+            await q.message.edit_text("User not found.")
+            return
+        if data.startswith("admin_approve_reset_"):
+            del db[target]
+            save_db(db)
+            try:
+                await context.bot.send_message(chat_id=int(target), text="✅ Your account reset was approved by admin and your data has been deleted.")
+            except Exception:
+                pass
+            await q.message.edit_text(f"User {target} reset approved and data deleted.")
+        else:
+            target_user["reset_request"] = None
+            save_db(db)
+            try:
+                await context.bot.send_message(chat_id=int(target), text="❌ Your account reset request was rejected by admin.")
+            except Exception:
+                pass
+            await q.message.edit_text(f"User {target} reset rejected.")
+        return
 
 # ---------------- HANDLERS ----------------
 async def start_handler(update: Update, context):
