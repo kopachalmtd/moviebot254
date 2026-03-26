@@ -15,6 +15,7 @@ app = Flask(__name__)
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+# Ensure this URL is exactly as shown below
 PAYHERO_API_URL = os.getenv("PAYHERO_API_URL", "https://backend.payhero.co.ke/api/v2/payments")
 
 # Supabase Config
@@ -74,15 +75,12 @@ async def callback_router(update: Update, context):
 
     if data == "menu":
         await q.message.edit_text("🎬 **Main Menu**", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
-
     elif data == "bal":
         await q.message.edit_text(f"💰 **Your balance:** KES {user['balance']}", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
-
     elif data == "deposit":
         user["state"] = "awaiting_amount"
         save_user(uid, user)
         await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
-
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
@@ -92,13 +90,11 @@ async def callback_router(update: Update, context):
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
         ]
         await q.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
     elif data == "admin_view_users":
         res = supabase.table("users").select("id, data").limit(15).execute()
         rows = [f"`{r['id']}` | KES {r['data'].get('balance',0)}" for r in res.data]
-        text = "👥 **Recent Users:**\n" + "\n".join(rows)
+        text = "👥 **Recent Users:**\n" + ("\n".join(rows) if rows else "No users found.")
         await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="admin_panel")]]), parse_mode="Markdown")
-
     elif data in ("admin_addbal", "admin_removebal", "admin_block"):
         user["state"] = f"{data}_wait_user"
         save_user(uid, user)
@@ -125,7 +121,6 @@ async def text_handler(update: Update, context):
                 user["state"] = None
                 save_user(uid, user)
                 await update.message.reply_text(f"✅ User `{text}` blocked status updated.")
-
         elif state.endswith("_wait_amount") and text.isdigit():
             target_uid = user.get("admin_target")
             amt = int(text)
@@ -142,7 +137,6 @@ async def text_handler(update: Update, context):
         user["state"] = "awaiting_phone"
         save_user(uid, user)
         await update.message.reply_text("📱 Enter M-Pesa Number (07... or 01... or 254...):")
-
     elif state == "awaiting_phone":
         formatted_phone = format_phone_number(text)
         if not formatted_phone:
@@ -153,19 +147,36 @@ async def text_handler(update: Update, context):
         user["state"] = None
         save_user(uid, user)
 
-        auth = base64.b64encode(f"{os.getenv('PAYHERO_USERNAME')}:{os.getenv('PAYHERO_PASSWORD')}".encode()).decode()
+        # PayHero Credentials
+        u_name = os.getenv("PAYHERO_USERNAME")
+        p_word = os.getenv("PAYHERO_PASSWORD")
+        auth = base64.b64encode(f"{u_name}:{p_word}".encode()).decode()
+        
         payload = {
             "amount": amt,
             "phone_number": formatted_phone,
             "channel_id": os.getenv("PAYHERO_CHANNEL_ID"),
-            "external_reference": f"{uid}_TOPUP_{int(time.time())}", # Unique Ref
+            "external_reference": f"{uid}_TOPUP_{int(time.time())}",
             "callback_url": f"https://{request.host}/payhero-callback"
         }
+        
+        # Call PayHero with detailed Debugging
         resp = requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
-        if resp.status_code in [200, 201]:
-            await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
-        else:
-            await update.message.reply_text("⚠️ PayHero rejected the request. Check your credentials.")
+        
+        # Logging to Vercel (Check your dashboard logs!)
+        print(f"DEBUG: PayHero Status: {resp.status_code}")
+        print(f"DEBUG: PayHero Response: {resp.text}")
+
+        try:
+            res_json = resp.json()
+            if resp.status_code in [200, 201] and (res_json.get("success") or res_json.get("status") == "Success"):
+                await update.message.reply_text(f"🚀 STK Push sent to {formatted_phone}. Check your phone!")
+            else:
+                # This grabs the specific error message from PayHero
+                error_detail = res_json.get("message", "Invalid API Credentials or Channel ID.")
+                await update.message.reply_text(f"⚠️ **PayHero Rejected:** {error_detail}")
+        except Exception:
+            await update.message.reply_text("⚠️ **System Error:** Failed to initiate STK push.")
 
 # ---------------- VERCEL ENTRY ----------------
 @app.route("/", methods=["POST"])
@@ -185,7 +196,8 @@ async def telegram_webhook():
 @app.route("/payhero-callback", methods=["POST"])
 def payhero_callback():
     payload = request.get_json(force=True)
-    data = payload.get("response", payload.get("data", {}))
+    # Handle different possible nesting from PayHero
+    data = payload.get("response", payload.get("data", payload))
     
     status = str(data.get("Status", "")).strip().capitalize()
     ref = data.get("ExternalReference", "")
@@ -200,13 +212,12 @@ def payhero_callback():
             user["balance"] += int(float(amount))
             save_user(uid, user)
             requests.post(url, json={"chat_id": uid, "text": f"✅ **Payment Received!**\nKES {amount} added to your balance.", "parse_mode": "Markdown"})
-        
         elif status in ["Cancelled", "Failed"]:
-            desc = data.get("Description", "Transaction failed or timed out.")
+            desc = data.get("Description", "Transaction failed or was cancelled.")
             requests.post(url, json={"chat_id": uid, "text": f"❌ **Transaction {status}**\n{desc}", "parse_mode": "Markdown"})
             
     return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot Online", 200
+    return "Bot 5 Online", 200
