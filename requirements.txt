@@ -1,4 +1,5 @@
-pyTelegramBotAPI
-flask
+python-telegram-bot
 supabase
+flask
 requests
+python-dotenv
