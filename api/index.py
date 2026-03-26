@@ -66,7 +66,7 @@ def main_menu_keyboard(uid):
 
 async def start_handler(update: Update):
     uid = str(update.effective_user.id)
-    msg = "🎬 **MovieBot254 Active**"
+    msg = "🎬 **MovieBot254 Active**\nWelcome to the main menu."
     if update.message:
         await update.message.reply_text(msg, reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
     elif update.callback_query:
@@ -79,21 +79,34 @@ async def callback_router(update: Update):
     user = get_user(uid)
     data = q.data
 
-    # BACK TO MENU
     if data == "menu":
         await start_handler(update)
-        return
-
-    if data == "bal":
+    
+    elif data == "bal":
         await q.message.edit_text(f"💰 **Your balance:** KES {user['balance']}", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
+    
     elif data == "deposit":
         user["state"] = "awaiting_amount"
         save_user(uid, user)
         await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
+
+    elif data == "browse_0":
+        await q.message.edit_text("🎥 **Movies List**\nFeature coming soon!", reply_markup=main_menu_keyboard(uid))
+
+    elif data == "myp":
+        await q.message.edit_text("💼 **My Purchases**\nYou haven't bought any movies yet.", reply_markup=main_menu_keyboard(uid))
+
+    elif data == "reset":
+        user["balance"] = 0
+        save_user(uid, user)
+        await q.message.edit_text("🔄 **Account Reset**\nYour balance has been set to 0.", reply_markup=main_menu_keyboard(uid))
+
+    elif data == "join_channel":
+        await q.message.edit_text("📢 **Join Channel**\nPlease join @YourChannelID to stay updated!", reply_markup=main_menu_keyboard(uid))
+
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
-            [InlineKeyboardButton("👥 View Users", callback_data="admin_view_users")],
             [InlineKeyboardButton("➕ Add Bal", callback_data="admin_addbal"), InlineKeyboardButton("➖ Rem Bal", callback_data="admin_removebal")],
             [InlineKeyboardButton("⛔ Block/Unblock", callback_data="admin_block")],
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
@@ -110,7 +123,7 @@ async def text_handler(update: Update):
     user = get_user(uid)
     text = (update.message.text or "").strip()
 
-    # --- ADMIN MULTI-STEP (Using DB storage) ---
+    # --- ADMIN LOGIC ---
     admin_action = user.get("admin_action")
     if admin_action:
         if admin_action.endswith("_wait_user"):
@@ -121,15 +134,13 @@ async def text_handler(update: Update):
                 await update.message.reply_text("Enter amount (KES):")
                 return
             
-            # Immediate actions (Block/Delete)
-            target = text
-            target_data = get_user(target)
+            target_data = get_user(text)
             if "block" in admin_action:
                 target_data["blocked"] = not target_data.get("blocked", False)
-                save_user(target, target_data)
-                await update.message.reply_text(f"User {target} blocked: {target_data['blocked']}")
+                save_user(text, target_data)
+                await update.message.reply_text(f"User {text} blocked: {target_data['blocked']}")
             
-            user["admin_action"] = None # Clear state
+            user["admin_action"] = None
             save_user(uid, user)
             return
 
@@ -140,19 +151,16 @@ async def text_handler(update: Update):
                 return
             amt = int(text)
             target_data = get_user(target)
-            
             if "addbal" in admin_action:
                 target_data["balance"] += amt
                 save_user(target, target_data)
                 await update.message.reply_text(f"Added KES {amt} to {target}.")
-                try: await application.bot.send_message(chat_id=int(target), text=f"✅ KES {amt} added to your balance.")
-                except: pass
             elif "removebal" in admin_action:
                 target_data["balance"] = max(0, target_data["balance"] - amt)
                 save_user(target, target_data)
                 await update.message.reply_text(f"Removed KES {amt} from {target}.")
-
-            user["admin_action"] = None # Clear state
+            
+            user["admin_action"] = None
             save_user(uid, user)
             return
 
@@ -167,7 +175,7 @@ async def text_handler(update: Update):
     elif state == "awaiting_phone":
         phone = format_phone_number(text)
         if not phone:
-            await update.message.reply_text("❌ Invalid format.")
+            await update.message.reply_text("❌ Invalid format. Use 07XXXXXXXX.")
             return
 
         amt = user["temp_amt"]
@@ -183,13 +191,18 @@ async def text_handler(update: Update):
         }
         
         try:
-            resp = requests.post(PAYHERO_API_URL, json=payload, headers=headers, timeout=10)
-            if resp.status_code in [200, 201] and resp.json().get("status") == "Success":
-                await update.message.reply_text(f"🚀 STK Push sent to {phone}!")
+            resp = requests.post(PAYHERO_API_URL, json=payload, headers=headers, timeout=15)
+            res_json = resp.json()
+            
+            # Check for Success (Case-insensitive check)
+            if resp.status_code in [200, 201] and str(res_json.get("status", "")).lower() == "success":
+                await update.message.reply_text(f"🚀 STK Push sent to {phone}. Check your phone!")
             else:
-                await update.message.reply_text(f"⚠️ Error: {resp.json().get('message', 'Rejected')}")
+                # This will show you exactly what PayHero said
+                error_msg = res_json.get("message", "Rejected by PayHero")
+                await update.message.reply_text(f"⚠️ **PayHero Error:** {error_msg}")
         except Exception as e:
-            await update.message.reply_text(f"📡 Error: {str(e)}")
+            await update.message.reply_text(f"📡 Connection Error: {str(e)}")
 
 # ---------------- WEBHOOK ----------------
 
@@ -198,8 +211,6 @@ async def telegram_webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-        
-        # Ensure the bot application is initialized and started
         async with application:
             if update.message and update.message.text:
                 if update.message.text == "/start":
@@ -208,7 +219,6 @@ async def telegram_webhook():
                     await text_handler(update)
             elif update.callback_query:
                 await callback_router(update)
-                
         return "OK", 200
     except Exception as e:
         print(f"WEBHOOK ERROR: {e}")
