@@ -46,9 +46,13 @@ def save_user(uid, data):
 def main_menu_keyboard(uid):
     kb = [
         [InlineKeyboardButton("🎥 Browse Movies", callback_data="browse_0")],
-        [InlineKeyboardButton("💳 Deposit", callback_data="deposit"), 
-         InlineKeyboardButton("💰 Balance", callback_data="bal")],
+        [InlineKeyboardButton("💳 Deposit", callback_data="deposit")],
         [InlineKeyboardButton("💼 My Purchases", callback_data="myp")],
+        [InlineKeyboardButton("💰 Balance", callback_data="bal")],
+        [InlineKeyboardButton("🔄 Reset Account", callback_data="reset")],
+        [InlineKeyboardButton("📢 Join Channel", callback_data="join_channel")],
+        [InlineKeyboardButton("☎ Contact Admin", callback_data="contact_admin")],
+        [InlineKeyboardButton("🎁 Claim Bonus", callback_data="claim_bonus")],
     ]
     if int(uid) in ADMIN_IDS:
         kb.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
