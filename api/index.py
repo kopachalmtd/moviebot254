@@ -1,11 +1,9 @@
 import os
 import re
 import json
-import asyncio
 import time
-import base64
-from flask import Flask, request
 import requests
+from flask import Flask, request
 from supabase import create_client, Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, ContextTypes
@@ -25,7 +23,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 application = ApplicationBuilder().token(TOKEN).build()
 
 # ---------------- MOVIE DATA ----------------
-# Added your list. Logic below handles 50 per page.
 MOVIES = [
     {"id": "movie1", "title": "Alice Boderland 1", "file_id": "BAACAgQAAxkBAAIB3mfhaf5rWiqi9HzvzqdtydVtoesdAAJ8DgACZmnoUEwzbnnZQMf3NgQ"},
     {"id": "movie2", "title": "Alice Boderland 2", "file_id": "BAACAgQAAxkBAAIBrWfhXaAb46Mg0dGuXEKQ27Lqm445AAKADgACZmnoUKH1QfB4s-TWNgQ"},
@@ -51,7 +48,7 @@ def format_phone_number(phone):
 def get_user(uid):
     res = supabase.table("users").select("data").eq("id", str(uid)).execute()
     if not res.data:
-        default_data = {"balance": 0, "purchases": [], "state": None, "temp_amt": None, "admin_action": None}
+        default_data = {"balance": 0, "purchases": [], "state": None, "temp_amt": None, "admin_action": None, "blocked": False}
         supabase.table("users").insert({"id": str(uid), "data": default_data}).execute()
         return default_data
     return res.data[0]['data']
@@ -76,8 +73,9 @@ def main_menu_keyboard(uid):
 
 async def start_handler(update: Update):
     uid = str(update.effective_user.id)
+    # Using reply_text so it appears at the bottom
     await update.effective_message.reply_text(
-        "🎬 **Welcome to MovieBot254**\n\nUse the buttons below to navigate:", 
+        "🎬 **MovieBot254 Main Menu**\nSelect an option below:", 
         reply_markup=main_menu_keyboard(uid), 
         parse_mode="Markdown"
     )
@@ -89,35 +87,44 @@ async def callback_router(update: Update):
     user = get_user(uid)
     data = q.data
 
+    # Use q.message.reply_text to send NEW messages at the bottom
     if data == "menu":
-        await q.message.edit_text("🎬 **Main Menu**", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
-
+        await start_handler(update)
+    
     elif data == "bal":
-        await q.message.edit_text(f"Dear Customer, your balance is **KSH {user['balance']}**.", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
+        await q.message.reply_text(f"Dear customer, your balance is **KSH {user['balance']}**.", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
 
-    # --- MOVIE PAGINATION (50 PER PAGE, 4 ROWS) ---
     elif data.startswith("browse_"):
         page = int(data.split("_")[1])
         per_page = 50
-        start = page * per_page
-        end = start + per_page
+        start, end = page * per_page, (page + 1) * per_page
         page_movies = MOVIES[start:end]
 
         kb = []
-        # Create 4 rows per page logic
-        for i in range(0, len(page_movies), 2): # 2 movies per row for readability
+        # Create a grid: 2 movies per row (approx 4-5 rows visible)
+        for i in range(0, len(page_movies), 2):
             row = [InlineKeyboardButton(m["title"][:15], callback_data=f"buy_{m['id']}") for m in page_movies[i:i+2]]
             kb.append(row)
 
-        nav_buttons = []
-        if page > 0: nav_buttons.append(InlineKeyboardButton("⬅ Prev", callback_data=f"browse_{page-1}"))
-        if end < len(MOVIES): nav_buttons.append(InlineKeyboardButton("Next ➡", callback_data=f"browse_{page+1}"))
-        if nav_buttons: kb.append(nav_buttons)
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"browse_{page-1}"))
+        if end < len(MOVIES): nav.append(InlineKeyboardButton("Next ➡", callback_data=f"browse_{page+1}"))
+        if nav: kb.append(nav)
         kb.append([InlineKeyboardButton("⬅ Back to Menu", callback_data="menu")])
 
-        await q.message.edit_text(f"🎥 **Movies (Page {page+1})**\nEach movie costs **KSH 10**", reply_markup=InlineKeyboardMarkup(kb))
+        await q.message.reply_text(f"🎥 **Movie Catalog (Page {page+1})**\nEach movie is KSH 10.", reply_markup=InlineKeyboardMarkup(kb))
 
-    # --- ADMIN PANEL ---
+    elif data.startswith("buy_"):
+        m_id = data.split("_")[1]
+        movie = next((m for m in MOVIES if m["id"] == m_id), None)
+        if user["balance"] < 10:
+            await q.message.reply_text(f"Dear customer, you have insufficient balance. Your balance is **KSH {user['balance']}**. Please top up.", reply_markup=main_menu_keyboard(uid))
+        else:
+            user["balance"] -= 10
+            user["purchases"].append(movie["title"])
+            save_user(uid, user)
+            await application.bot.send_video(chat_id=uid, video=movie["file_id"], caption=f"✅ Enjoy your movie: {movie['title']}")
+
     elif data == "admin_panel":
         if int(uid) not in ADMIN_IDS: return
         kb = [
@@ -127,73 +134,68 @@ async def callback_router(update: Update):
             [InlineKeyboardButton("🗑️ Delete User", callback_data="admin_delete")],
             [InlineKeyboardButton("⬅ Back", callback_data="menu")],
         ]
-        await q.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb))
-
-    elif data == "admin_view_users":
-        res = supabase.table("users").select("id").execute()
-        user_list = "\n".join([f"• `{u['id']}`" for u in res.data])
-        await q.message.edit_text(f"👥 **Total Users:** {len(res.data)}\n\n{user_list}", reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
-
-    elif data.startswith("admin_"):
-        user["admin_action"] = data + "_wait_user"
-        save_user(uid, user)
-        await q.message.edit_text("🎯 Send the **Target User ID**:")
+        await q.message.reply_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "deposit":
         user["state"] = "awaiting_amount"
         save_user(uid, user)
-        await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
+        await q.message.reply_text("💳 **Deposit**\nEnter amount to deposit (KES):")
 
 async def text_handler(update: Update):
     uid = str(update.effective_user.id)
     user = get_user(uid)
     text = (update.message.text or "").strip()
 
-    # --- DEPOSIT LOGIC (Where it was freezing) ---
-    state = user.get("state")
-    if state == "awaiting_amount" and text.isdigit():
+    # Admin Logic (Add/Remove Balance etc)
+    if user.get("admin_action") and user["admin_action"].endswith("_wait_user"):
+        user["admin_target"] = text
+        action = user["admin_action"]
+        if "addbal" in action or "removebal" in action:
+            user["admin_action"] = action.replace("_wait_user", "_wait_amount")
+            save_user(uid, user)
+            await update.message.reply_text(f"Targeting User `{text}`. Enter amount:")
+            return
+        elif "delete" in action:
+            supabase.table("users").delete().eq("id", text).execute()
+            await update.message.reply_text(f"✅ User `{text}` deleted from database.")
+            user["admin_action"] = None
+            save_user(uid, user)
+            return
+
+    # Deposit Logic
+    if user.get("state") == "awaiting_amount" and text.isdigit():
         user["temp_amt"] = int(text)
         user["state"] = "awaiting_phone"
         save_user(uid, user)
         await update.message.reply_text("📱 Enter M-Pesa Number (07...):")
-        return
-
-    elif state == "awaiting_phone":
+    
+    elif user.get("state") == "awaiting_phone":
         phone = format_phone_number(text)
         if not phone:
-            await update.message.reply_text("❌ Invalid format. Please use 07XXXXXXXX.")
+            await update.message.reply_text("❌ Invalid phone.")
             return
 
         amt = user["temp_amt"]
-        user["state"] = None # Clear state immediately to prevent loops
+        user["state"] = None
         save_user(uid, user)
 
-        # PREPARE PAYHERO REQUEST
-        headers = {
-            'Authorization': f'Basic {os.getenv("PAYHERO_AUTH")}', 
-            'Content-Type': 'application/json'
-        }
+        headers = {'Authorization': f'Basic {os.getenv("PAYHERO_AUTH")}', 'Content-Type': 'application/json'}
         payload = {
-            "amount": amt,
-            "phone_number": phone,
-            "channel_id": int(os.getenv("PAYHERO_CHANNEL_ID", "4131")),
-            "provider": "m-pesa",
-            "external_reference": f"{uid}_TOPUP_{int(time.time())}",
+            "amount": amt, "phone_number": phone, "channel_id": int(os.getenv("PAYHERO_CHANNEL_ID", "4131")),
+            "provider": "m-pesa", "external_reference": f"{uid}_TOPUP_{int(time.time())}",
             "callback_url": f"https://{request.host}/payhero-callback"
         }
-
+        
         try:
-            # Added a timeout to prevent freezing
             resp = requests.post(PAYHERO_API_URL, json=payload, headers=headers, timeout=15)
-            
             if resp.status_code in [200, 201]:
-                await update.message.reply_text(f"🚀 **STK Push Sent!**\nPlease check your phone ({phone}) to confirm the KSH {amt} payment.", reply_markup=main_menu_keyboard(uid))
+                await update.message.reply_text(f"🚀 STK Push sent to {phone}. Confirm on your phone!")
             else:
-                await update.message.reply_text(f"⚠️ **PayHero Error:** {resp.text}", reply_markup=main_menu_keyboard(uid))
+                await update.message.reply_text(f"⚠️ PayHero error: {resp.text}", reply_markup=main_menu_keyboard(uid))
         except Exception as e:
-            await update.message.reply_text(f"📡 **Connection Error:** Could not reach payment server.\nError: {str(e)}", reply_markup=main_menu_keyboard(uid))
+            await update.message.reply_text(f"📡 Connection error. Please try again.", reply_markup=main_menu_keyboard(uid))
 
-# ---------------- WEBHOOK ----------------
+# ---------------- WEBHOOK & CALLBACK ----------------
 
 @app.route("/", methods=["POST"])
 async def telegram_webhook():
@@ -207,15 +209,28 @@ async def telegram_webhook():
             elif update.callback_query:
                 await callback_router(update)
         return "OK", 200
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return "OK", 200
+    except: return "OK", 200
 
 @app.route("/payhero-callback", methods=["POST"])
 def payhero_callback():
-    # ... (Same callback logic from previous turn) ...
+    payload = request.get_json(force=True)
+    inner_data = payload.get("response", payload.get("data", {}))
+    status = str(inner_data.get("Status", inner_data.get("status", ""))).strip().lower()
+    ref = inner_data.get("ExternalReference", inner_data.get("external_reference", ""))
+    
+    if "_TOPUP_" in ref:
+        uid = ref.split("_TOPUP_")[0]
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        
+        if status == "success":
+            user = get_user(uid)
+            user["balance"] += int(float(inner_data.get("Amount", 0)))
+            save_user(uid, user)
+            requests.post(url, json={"chat_id": uid, "text": "✅ **Payment Confirmed!** Balance updated.", "reply_markup": main_menu_keyboard(uid).to_dict()})
+        else:
+            requests.post(url, json={"chat_id": uid, "text": f"❌ **Payment {status.capitalize()}**. Please try again.", "reply_markup": main_menu_keyboard(uid).to_dict()})
     return "OK", 200
 
 @app.route("/")
 def index():
-    return "Bot Online", 200
+    return "Bot kamaa Online", 200
