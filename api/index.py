@@ -1,98 +1,148 @@
 import os
-import requests
-import telebot
+import re
+import json
+import asyncio
+import base64
+from datetime import datetime
 from flask import Flask, request, jsonify
+import requests
 from supabase import create_client, Client
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 app = Flask(__name__)
 
-# --- CONFIG ---
-TOKEN = "7292856168:AAFYNTxrWzyxpO1RMEC_BL5rw7E5-xfcmSM"
-# Use your actual Supabase credentials from Vercel Env Variables
-supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
-bot = telebot.TeleBot(TOKEN, threaded=False)
+# ---------------- CONFIG ----------------
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+MOVIE_COST = int(os.getenv("MOVIE_COST", "10"))
+PAYHERO_API_URL = os.getenv("PAYHERO_API_URL")
 
-MOVIES_PER_PAGE = 12
-# Add your full list of 145 movies here
-MOVIES = [
-    {"id": "m1", "title": "Alice Boderland", "file_id": "FILE_ID_1"},
-    {"id": "m2", "title": "See", "file_id": "FILE_ID_2"},
-    # ... include the rest of your list
-]
+# Supabase Config
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- DB HELPERS ---
-def get_user_data(uid):
+# Initialize Bot Application for Webhook mode
+# Note: We don't use run_polling() on Vercel
+application = ApplicationBuilder().token(TOKEN).build()
+
+# ---------------- SUPABASE HELPERS ----------------
+def get_user(uid):
     res = supabase.table("users").select("data").eq("id", str(uid)).execute()
     if not res.data:
-        default = {"balance": 0, "purchases": [], "state": None}
-        supabase.table("users").insert({"id": str(uid), "data": default}).execute()
-        return default
+        default_data = {
+            "balance": 0, "purchases": [], "purchase_history": [],
+            "pending_payments": [], "blocked": False, "state": None, "temp_amt": None
+        }
+        supabase.table("users").insert({"id": str(uid), "data": default_data}).execute()
+        return default_data
     return res.data[0]['data']
 
-def save_user_data(uid, data):
+def save_user(uid, data):
     supabase.table("users").upsert({"id": str(uid), "data": data}).execute()
 
-# --- KEYBOARDS ---
-def main_menu():
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        telebot.types.InlineKeyboardButton("🎥 Browse Movies", callback_data="browse_0"),
-        telebot.types.InlineKeyboardButton("💳 Deposit", callback_data="deposit"),
-        telebot.types.InlineKeyboardButton("💰 Balance", callback_data="bal"),
-        telebot.types.InlineKeyboardButton("💼 My Purchases", callback_data="myp")
-    )
-    return markup
+# ---------------- KEYBOARDS ----------------
+def main_menu_keyboard(uid):
+    kb = [
+        [InlineKeyboardButton("🎥 Browse Movies", callback_data="browse_0")],
+        [InlineKeyboardButton("💳 Deposit", callback_data="deposit"), 
+         InlineKeyboardButton("💰 Balance", callback_data="bal")],
+        [InlineKeyboardButton("💼 My Purchases", callback_data="myp")],
+    ]
+    if int(uid) in ADMIN_IDS:
+        kb.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(kb)
 
-# --- BOT HANDLERS ---
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "🎬 **Welcome to MovieBot254!**", 
-                     reply_markup=main_menu(), parse_mode="Markdown")
+# ---------------- HANDLERS ----------------
+async def start_handler(update: Update, context):
+    uid = str(update.effective_user.id)
+    get_user(uid) # Ensure user exists
+    await update.message.reply_text("🎬 **Welcome to MovieBot254!**", 
+                                  reply_markup=main_menu_keyboard(uid), parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_query(call):
-    uid = str(call.from_user.id)
-    user = get_user_data(uid)
+async def callback_router(update: Update, context):
+    q = update.callback_query
+    await q.answer()
+    uid = str(q.from_user.id)
+    user = get_user(uid)
+    data = q.data
+
+    if data == "bal":
+        await q.message.edit_text(f"💰 Your balance: KES {user['balance']}", 
+                                 reply_markup=main_menu_keyboard(uid))
     
-    if call.data.startswith("browse_"):
-        page = int(call.data.split("_")[1])
-        start_idx = page * MOVIES_PER_PAGE
-        end_idx = start_idx + MOVIES_PER_PAGE
-        page_movies = MOVIES[start_idx:end_idx]
-        
-        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-        for m in page_movies:
-            markup.add(telebot.types.InlineKeyboardButton(m["title"], callback_data=f"buy_{m['id']}"))
-        
-        nav = []
-        if page > 0: nav.append(telebot.types.InlineKeyboardButton("⬅ Prev", callback_data=f"browse_{page-1}"))
-        if end_idx < len(MOVIES): nav.append(telebot.types.InlineKeyboardButton("Next ➡", callback_data=f"browse_{page+1}"))
-        if nav: markup.row(*nav)
-        markup.add(telebot.types.InlineKeyboardButton("🏠 Menu", callback_data="menu"))
-        
-        bot.edit_message_text("🎥 **Choose a movie (Ksh 10):**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    elif data == "deposit":
+        user["state"] = "awaiting_amount"
+        save_user(uid, user)
+        await q.message.edit_text("💳 **Deposit**\nEnter amount to deposit (KES):")
 
-    elif call.data == "bal":
-        bot.answer_callback_query(call.id, f"Balance: Ksh {user['balance']}", show_alert=True)
+async def text_handler(update: Update, context):
+    uid = str(update.effective_user.id)
+    user = get_user(uid)
+    text = update.message.text
+    
+    if user.get("state") == "awaiting_amount" and text.isdigit():
+        user["temp_amt"] = int(text)
+        user["state"] = "awaiting_phone"
+        save_user(uid, user)
+        await update.message.reply_text("📱 Enter Safaricom Number (07...):")
+        
+    elif user.get("state") == "awaiting_phone":
+        phone = re.sub(r"[^0-9]", "", text)
+        amt = user["temp_amt"]
+        user["state"] = None
+        save_user(uid, user)
+        
+        # PayHero STK Push Logic
+        auth = base64.b64encode(f"{os.getenv('PAYHERO_USERNAME')}:{os.getenv('PAYHERO_PASSWORD')}".encode()).decode()
+        payload = {
+            "amount": amt,
+            "phone_number": phone,
+            "channel_id": os.getenv("PAYHERO_CHANNEL_ID"),
+            "external_reference": f"{uid}_TOPUP_{amt}",
+            "callback_url": f"https://{request.host}/payhero-callback"
+        }
+        requests.post(PAYHERO_API_URL, json=payload, headers={"Authorization": f"Basic {auth}"})
+        await update.message.reply_text("✅ STK Push sent! Complete on your phone.")
 
-# --- VERCEL WEBHOOK ROUTE ---
-@app.route('/', methods=['POST'])
-def telegram_webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return "OK", 200
-    return "Forbidden", 403
+# ---------------- VERCEL ROUTES ----------------
 
-# --- PAYHERO CALLBACK ROUTE ---
-@app.route('/payhero-callback', methods=['POST'])
-def payhero_callback():
-    payload = request.get_json()
-    # Check for success and extract 'ExternalReference' (formatted as USERID_TOPUP_AMT)
-    # Update balance in Supabase here...
+@app.route("/", methods=["POST"])
+async def telegram_webhook():
+    """Process updates from Telegram"""
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    
+    # Manually route since we are in serverless mode
+    if update.message and update.message.text:
+        if update.message.text == "/start":
+            await start_handler(update, None)
+        else:
+            await text_handler(update, None)
+    elif update.callback_query:
+        await callback_router(update, None)
+        
     return "OK", 200
 
-@app.route('/')
+@app.route("/payhero-callback", methods=["POST"])
+def payhero_callback():
+    """Update Supabase balance when payment is successful"""
+    data = request.get_json(force=True).get("response", {})
+    if data.get("Status") == "Success":
+        ref = data.get("ExternalReference", "")
+        uid = ref.split("_TOPUP_")[0]
+        amount = int(float(data.get("Amount", 0)))
+        
+        user = get_user(uid)
+        user["balance"] += amount
+        save_user(uid, user)
+        
+        # Notify user (Optional: Requires a separate bot instance call)
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": uid, "text": f"✅ Received KES {amount}!"})
+        
+    return "OK", 200
+
+@app.route("/", methods=["GET"])
 def index():
-    return "MovieBot is Live on Vercel", 200
+    return "Bot is Active", 200
